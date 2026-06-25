@@ -1,0 +1,292 @@
+###############################################################
+# FUNCTIONS
+###############################################################
+
+function Write-Log
+{
+    param(
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+
+    $Time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+    $Line = "$Time [$Level] $Message"
+
+    Add-Content `
+        -Path $LogFile `
+        -Value $Line
+
+    switch ($Level)
+    {
+        "INFO"    { Write-Host $Line -ForegroundColor $ColorInfo }
+        "SUCCESS" { Write-Host $Line -ForegroundColor $ColorSuccess }
+        "WARNING" { Write-Host $Line -ForegroundColor $ColorWarning }
+        "ERROR"   { Write-Host $Line -ForegroundColor $ColorError }
+        default   { Write-Host $Line }
+    }
+}
+
+###############################################################
+
+function New-Progress
+{
+    param(
+        [int]$Current,
+        [int]$Total,
+        [string]$Mailbox
+    )
+
+    $Elapsed = (Get-Date) - $ScriptStart
+
+    if($Current -gt 1)
+    {
+        $Average = $Elapsed.TotalSeconds / $Current
+        $RemainingSeconds = ($Total - $Current) * $Average
+        $Remaining = [TimeSpan]::FromSeconds($RemainingSeconds)
+    }
+    else
+    {
+        $Remaining = [TimeSpan]::Zero
+    }
+
+    $Percent = [math]::Round(($Current / $Total) * 100,1)
+
+    Write-Progress `
+        -Activity "Create ESG Groups" `
+        -Status "$Current / $Total - $Mailbox - Remaining $($Remaining.ToString('hh\:mm\:ss'))" `
+        -PercentComplete $Percent
+}
+
+###############################################################
+
+function Get-GroupName
+{
+    param(
+        [string]$Mailbox
+    )
+
+    return "$GroupPrefix$Mailbox"
+}
+
+###############################################################
+
+function Get-Alias
+{
+    param(
+        [string]$Mailbox
+    )
+
+    return ($Mailbox -replace "@","_" -replace "\.",".")
+}
+
+###############################################################
+
+function Group-Exists
+{
+    param(
+        [string]$GroupName
+    )
+
+    try
+    {
+        Get-DistributionGroup `
+            -Identity $GroupName `
+            -ErrorAction Stop | Out-Null
+
+        return $true
+    }
+    catch
+    {
+        return $false
+    }
+}
+
+###############################################################
+
+function Create-Group
+{
+    param(
+        [string]$Mailbox
+    )
+
+    $GroupName = Get-GroupName $Mailbox
+    $Alias = Get-Alias $Mailbox
+
+    if(Group-Exists $GroupName)
+    {
+        Write-Log "$GroupName already exists." "WARNING"
+        return
+    }
+
+    if($Simulation)
+    {
+        Write-Log "[SIMULATION] Create $GroupName" "INFO"
+        return
+    }
+
+    New-DistributionGroup `
+        -Name $GroupName `
+        -Type Security `
+        -OrganizationalUnit $OrganizationalUnit `
+        -Alias $Alias
+
+    Write-Log "$GroupName created." "SUCCESS"
+}
+
+###############################################################
+
+function Add-GroupMembers
+{
+    param(
+        [string]$GroupName,
+        [string]$Members
+    )
+
+    if([string]::IsNullOrWhiteSpace($Members))
+    {
+        Write-Log "$GroupName : no members found." "WARNING"
+        return
+    }
+
+    $Users = $Members.Split(";") |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { $_ -ne "" }
+
+    foreach($User in $Users)
+    {
+        try
+        {
+            Get-Recipient -Identity $User -ErrorAction Stop | Out-Null
+
+            if($Simulation)
+            {
+                Write-Log "[SIMULATION] Add $User to $GroupName" "INFO"
+            }
+            else
+            {
+                Add-DistributionGroupMember `
+                    -Identity $GroupName `
+                    -Member $User `
+                    -ErrorAction Stop
+
+                Write-Log "$User added to $GroupName." "SUCCESS"
+            }
+        }
+        catch
+        {
+            Write-Log "$User not found." "ERROR"
+        }
+    }
+}
+
+###############################################################
+
+function Start-DeltaSync
+{
+    if(!$RunADSync)
+    {
+        return
+    }
+
+    if($Simulation)
+    {
+        Write-Log "[SIMULATION] Start-ADSyncSyncCycle" "INFO"
+        return
+    }
+
+    Write-Log "Starting Azure AD Connect Delta Sync..." "INFO"
+
+    Start-ADSyncSyncCycle `
+        -PolicyType Delta
+
+    Write-Log "Synchronization started." "SUCCESS"
+}
+
+###############################################################
+
+function Wait-ForSync
+{
+    if(!$RunADSync)
+    {
+        return
+    }
+
+    if($Simulation)
+    {
+        return
+    }
+
+    for($i=$WaitAfterSyncMinutes;$i-ge 1;$i--)
+    {
+        Write-Progress `
+            -Activity "Waiting for Azure AD Sync" `
+            -Status "$i minute(s) remaining" `
+            -PercentComplete ((($WaitAfterSyncMinutes-$i)/$WaitAfterSyncMinutes)*100)
+
+        Start-Sleep -Seconds 60
+    }
+
+    Write-Progress `
+        -Activity "Waiting for Azure AD Sync" `
+        -Completed
+}
+
+###############################################################
+
+function Add-Result
+{
+    param(
+        $Mailbox,
+        $Group,
+        $Users,
+        $Status
+    )
+
+    $script:Report.Add(
+        [PSCustomObject]@{
+
+            SharedMailbox = $Mailbox
+
+            ESGGroup = $Group
+
+            Members = $Users
+
+            Status = $Status
+
+            Date = Get-Date
+
+        }
+    )
+}
+
+###############################################################
+
+function Export-Result
+{
+    $Report |
+        Export-Excel `
+            -Path $ResultFile `
+            -WorksheetName "Created ESG" `
+            -AutoSize `
+            -FreezeTopRow `
+            -BoldTopRow
+
+    Write-Log "Excel exported to $ResultFile" "SUCCESS"
+}
+
+###############################################################
+
+function Finish-Script
+{
+    $Duration = (Get-Date) - $ScriptStart
+
+    Write-Host ""
+    Write-Host "==============================================" -ForegroundColor Green
+    Write-Host "Finished" -ForegroundColor Green
+    Write-Host "Processed Groups : $($Report.Count)"
+    Write-Host "Duration         : $($Duration.ToString('hh\:mm\:ss'))"
+    Write-Host "Log              : $LogFile"
+    Write-Host "Excel            : $ResultFile"
+    Write-Host "==============================================" -ForegroundColor Green
+}
